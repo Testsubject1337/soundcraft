@@ -2,7 +2,7 @@
 //! Tools' I/O Setup defines them. A track's input route names one (`Route::Hardware(name)`); the
 //! path says which interface channels feed it.
 
-use crate::{ChannelFormat, MAX_NAME_CHARS, Route, Session, truncate_chars};
+use crate::{Bus, BusSubId, BusSubPath, ChannelFormat, MAX_NAME_CHARS, OutputPath, Route, Session, truncate_chars};
 
 /// The highest hardware input channel (0-based) a path may name: more than any interface offers.
 pub const MAX_INPUT_CHANNEL: u16 = 1023;
@@ -221,6 +221,264 @@ impl Session {
     }
 }
 
+impl OutputPath {
+    /// A path with nothing assigned yet.
+    pub fn new(name: impl Into<String>, format: ChannelFormat) -> OutputPath {
+        OutputPath { name: name.into(), first_channel: 0, format, channels: vec![None; format.channels()], active: true }
+    }
+
+    /// A path driving the hardware channels from `first` on, in order.
+    pub fn assigned(name: impl Into<String>, format: ChannelFormat, first: u16) -> OutputPath {
+        let mut p = OutputPath::new(name, format);
+        p.assign_from(first);
+        p
+    }
+
+    /// Drives the channels from hardware channel `first` on, in order (the grid's click), capped
+    /// at [`MAX_INPUT_CHANNEL`].
+    pub fn assign_from(&mut self, first: u16) {
+        for (k, c) in self.channels.iter_mut().enumerate() {
+            *c = Some(first.saturating_add(u16::try_from(k).unwrap_or(u16::MAX)).min(MAX_INPUT_CHANNEL));
+        }
+        self.first_channel = first.min(MAX_INPUT_CHANNEL);
+    }
+
+    /// Changes the format; the assignment is kept as far as it fits.
+    pub fn set_format(&mut self, format: ChannelFormat) {
+        self.format = format;
+        self.channels.resize(format.channels(), None);
+    }
+
+    pub fn width(&self) -> usize {
+        self.channels.len()
+    }
+
+    pub fn complete(&self) -> bool {
+        self.channels.iter().all(Option::is_some)
+    }
+
+    /// The hardware channel a path channel drives, 0-based.
+    pub fn hardware(&self, k: usize) -> Option<u16> {
+        self.channels.get(k).copied().flatten()
+    }
+
+    /// Which path channel drives hardware channel `hw`, if any.
+    pub fn channel_on(&self, hw: u16) -> Option<usize> {
+        self.channels.iter().position(|c| *c == Some(hw))
+    }
+
+    /// Keeps a path read from a file consistent: as many channels as the format (a file from
+    /// before the map existed gets them in order from `first_channel`), each in range and used
+    /// once; `first_channel` follows the map.
+    pub fn sanitize(&mut self) {
+        truncate_chars(&mut self.name, MAX_NAME_CHARS);
+        if self.channels.is_empty() && self.format.channels() > 0 {
+            self.channels = vec![None; self.format.channels()];
+            let first = self.first_channel;
+            self.assign_from(first);
+        }
+        self.channels.resize(self.format.channels(), None);
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &mut self.channels {
+            if let Some(ch) = *c
+                && (ch > MAX_INPUT_CHANNEL || !seen.insert(ch))
+            {
+                *c = None;
+            }
+        }
+        self.first_channel = self.channels.iter().flatten().copied().min().unwrap_or(0);
+    }
+}
+
+impl BusSubPath {
+    /// A sub-path of a bus reading nothing yet.
+    pub fn new(id: BusSubId, name: impl Into<String>, format: ChannelFormat) -> BusSubPath {
+        BusSubPath { id, name: name.into(), format, channels: vec![None; format.channels()] }
+    }
+
+    pub fn width(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Reads the bus channels from `first` on, in order (the grid's click); channels past the
+    /// bus's width stay unassigned.
+    pub fn assign_from(&mut self, first: u8, bus_width: usize) {
+        for (k, c) in self.channels.iter_mut().enumerate() {
+            let ch = usize::from(first).saturating_add(k);
+            *c = (ch < bus_width).then(|| u8::try_from(ch).unwrap_or(u8::MAX));
+        }
+    }
+
+    /// Which sub-path channel reads bus channel `ch`, if any.
+    pub fn channel_on(&self, ch: u8) -> Option<usize> {
+        self.channels.iter().position(|c| *c == Some(ch))
+    }
+
+    /// The bus channels in sub-path order, `None` where unassigned.
+    pub fn bus_channels(&self) -> &[Option<u8>] {
+        &self.channels
+    }
+
+    fn sanitize(&mut self, bus_width: usize) {
+        truncate_chars(&mut self.name, MAX_NAME_CHARS);
+        self.channels.resize(self.format.channels(), None);
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &mut self.channels {
+            if let Some(ch) = *c
+                && (usize::from(ch) >= bus_width || !seen.insert(ch))
+            {
+                *c = None;
+            }
+        }
+    }
+}
+
+impl Bus {
+    pub fn width(&self) -> usize {
+        self.format.channels()
+    }
+
+    /// Keeps a bus read from a file consistent: bounded names and sub-paths, each sub-path within
+    /// the bus.
+    pub fn sanitize(&mut self) {
+        truncate_chars(&mut self.name, MAX_NAME_CHARS);
+        if let Some(o) = &mut self.output {
+            truncate_chars(o, MAX_NAME_CHARS);
+        }
+        self.sub_paths.truncate(MAX_SUB_PATHS);
+        let w = self.width();
+        self.sub_paths.iter_mut().for_each(|sp| sp.sanitize(w));
+    }
+}
+
+/// The sub-paths Pro Tools makes for a new bus, as for an input path: `.L` and `.R` for stereo,
+/// a stereo `.LR` and a mono per channel for wider formats, none for mono. Ids come from `alloc`.
+pub fn default_bus_sub_paths(bus: &Bus, mut alloc: impl FnMut() -> u64) -> Vec<BusSubPath> {
+    let speakers = bus.format.speakers();
+    if speakers.len() < 2 || bus.format.is_ambisonic() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut sub = |name: String, format: ChannelFormat, from: &[usize]| {
+        let mut p = BusSubPath::new(BusSubId(alloc()), name, format);
+        for (c, k) in p.channels.iter_mut().zip(from) {
+            *c = u8::try_from(*k).ok();
+        }
+        p
+    };
+    if speakers.len() > 2 {
+        out.push(sub(format!("{}.LR", bus.name), ChannelFormat::Stereo, &[0, 1]));
+    }
+    for (k, sp) in speakers.iter().enumerate() {
+        out.push(sub(format!("{}.{}", bus.name, sp.label()), ChannelFormat::Mono, &[k]));
+    }
+    out
+}
+
+impl Session {
+    /// The output paths of an interface with `channels` outputs, as Pro Tools' Stereo Mix
+    /// settings make them: a stereo path per pair (`Out 1-2`), an odd last channel mono. The
+    /// first is the main (monitor) path.
+    pub fn default_output_paths(channels: usize) -> Vec<OutputPath> {
+        let channels = channels.clamp(1, MAX_INPUT_CHANNEL as usize + 1);
+        let mut out = Vec::new();
+        let mut c = 0usize;
+        while c < channels {
+            let first = c as u16;
+            if c + 1 < channels {
+                out.push(OutputPath::assigned(format!("Out {}-{}", c + 1, c + 2), ChannelFormat::Stereo, first));
+                c += 2;
+            } else {
+                out.push(OutputPath::assigned(format!("Out {}", c + 1), ChannelFormat::Mono, first));
+                c += 1;
+            }
+        }
+        out
+    }
+
+    /// Where the output path named `name` is (ignoring case).
+    pub fn find_output_path(&self, name: &str) -> Option<usize> {
+        self.outputs.iter().position(|o| o.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn output_path(&self, name: &str) -> Option<&OutputPath> {
+        self.outputs.iter().find(|o| o.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The output path the main mix drives: the one the I/O Setup names (when it exists and is
+    /// active), else the first active path.
+    pub fn monitor_output_path(&self) -> Option<&OutputPath> {
+        self.monitor_output.as_deref().and_then(|n| self.output_path(n)).filter(|o| o.active).or_else(|| self.outputs.iter().find(|o| o.active))
+    }
+
+    /// The output path the main meter shows: the one the I/O Setup names, else the monitor path.
+    pub fn meter_output_path(&self) -> Option<&OutputPath> {
+        self.meter_output.as_deref().and_then(|n| self.output_path(n)).filter(|o| o.active).or_else(|| self.monitor_output_path())
+    }
+
+    /// Whether `name` is the monitor path (the main mix), so a track routed to it by name is
+    /// routed to the main mix.
+    pub fn is_monitor_output(&self, name: &str) -> bool {
+        self.monitor_output_path().is_some_and(|o| o.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The bus a sub-path belongs to, and the sub-path.
+    pub fn bus_sub(&self, id: BusSubId) -> Option<(&Bus, &BusSubPath)> {
+        self.busses.iter().find_map(|b| b.sub_paths.iter().find(|sp| sp.id == id).map(|sp| (b, sp)))
+    }
+
+    /// A bus or bus sub-path by name (ignoring case): the bus, and the sub-path when it is one.
+    pub fn bus_path_by_name(&self, name: &str) -> Option<(&Bus, Option<&BusSubPath>)> {
+        self.busses.iter().find_map(|b| {
+            if b.name.eq_ignore_ascii_case(name) {
+                return Some((b, None));
+            }
+            b.sub_paths.iter().find(|sp| sp.name.eq_ignore_ascii_case(name)).map(|sp| (b, Some(sp)))
+        })
+    }
+
+    /// Internal mix busses as Pro Tools' defaults name them: `Bus 1-2`, `Bus 3-4`… (`count`
+    /// stereo busses), each with `.L`/`.R` sub-paths. Busses that exist already (by name) are kept.
+    pub fn add_default_busses(&mut self, count: usize) -> Vec<crate::BusId> {
+        let mut out = Vec::new();
+        for i in 0..count.min(128) {
+            let name = format!("Bus {}-{}", 2 * i + 1, 2 * i + 2);
+            if self.bus_by_name(&name).is_some() {
+                continue;
+            }
+            let id = self.add_bus(&name, ChannelFormat::Stereo);
+            let subs = self.bus(id).map(|b| default_bus_sub_paths(b, || 0)).unwrap_or_default();
+            let subs: Vec<BusSubPath> = subs
+                .into_iter()
+                .map(|mut sp| {
+                    sp.id = BusSubId(self.alloc());
+                    sp
+                })
+                .collect();
+            if let Some(b) = self.busses.iter_mut().find(|b| b.id == id) {
+                b.sub_paths = subs;
+            }
+            out.push(id);
+        }
+        out
+    }
+
+    /// Output busses as Pro Tools makes them: a bus named after each active output path, of its
+    /// format, mapped to it. Existing busses of those names are mapped, not duplicated.
+    pub fn add_output_busses(&mut self) -> Vec<crate::BusId> {
+        let paths: Vec<(String, ChannelFormat)> = self.outputs.iter().filter(|o| o.active).map(|o| (o.name.clone(), o.format)).collect();
+        let mut out = Vec::new();
+        for (name, format) in paths {
+            let id = self.add_bus(&name, format);
+            if let Some(b) = self.busses.iter_mut().find(|b| b.id == id) {
+                b.output = Some(name);
+            }
+            out.push(id);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +566,88 @@ mod tests {
         let mut m = InputPath::assigned("m", ChannelFormat::Mono, u16::MAX);
         m.assign_from(MAX_INPUT_CHANNEL);
         assert_eq!(m.channels, [Some(MAX_INPUT_CHANNEL)]);
+    }
+
+    #[test]
+    fn output_paths_default_per_pair_and_the_first_is_the_monitor() {
+        let s = Session::default();
+        assert_eq!(s.outputs.len(), 1);
+        assert_eq!(s.outputs[0].channels, [Some(0), Some(1)]);
+        assert_eq!(s.outputs[0].first_channel, 0);
+        let paths = Session::default_output_paths(5);
+        let names: Vec<&str> = paths.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Out 1-2", "Out 3-4", "Out 5"]);
+        assert_eq!(paths[1].channels, [Some(2), Some(3)]);
+        assert_eq!(paths[1].first_channel, 2);
+        let mut s = Session::new("x", Default::default());
+        s.outputs = Session::default_output_paths(4);
+        assert_eq!(s.monitor_output_path().map(|o| o.name.as_str()), Some("Out 1-2"));
+        assert!(s.is_monitor_output("out 1-2"));
+        s.monitor_output = Some("Out 3-4".into());
+        assert_eq!(s.monitor_output_path().map(|o| o.name.as_str()), Some("Out 3-4"));
+        assert_eq!(s.meter_output_path().map(|o| o.name.as_str()), Some("Out 3-4"), "the meter follows the monitor unless named");
+        s.meter_output = Some("Out 1-2".into());
+        assert_eq!(s.meter_output_path().map(|o| o.name.as_str()), Some("Out 1-2"));
+        s.outputs[1].active = false;
+        assert_eq!(s.monitor_output_path().map(|o| o.name.as_str()), Some("Out 1-2"), "an inactive monitor path falls back to the first active");
+        s.outputs[0].format = ChannelFormat::Surround51;
+        assert_eq!(s.main_format(), ChannelFormat::Surround51, "the main format is the monitor path's");
+    }
+
+    #[test]
+    fn an_output_path_from_before_the_map_gets_it_from_its_first_channel() {
+        let mut p = OutputPath { name: "Out 3-4".into(), first_channel: 2, format: ChannelFormat::Stereo, channels: Vec::new(), active: true };
+        p.sanitize();
+        assert_eq!(p.channels, [Some(2), Some(3)]);
+        let mut hostile =
+            OutputPath { name: "x".repeat(400), first_channel: 9, format: ChannelFormat::Mono, channels: vec![Some(5000), Some(1)], active: true };
+        hostile.sanitize();
+        assert_eq!((hostile.channels.clone(), hostile.first_channel), (vec![None], 0));
+        assert_eq!(hostile.name.chars().count(), MAX_NAME_CHARS);
+        let mut dup = OutputPath::assigned("d", ChannelFormat::Stereo, 4);
+        dup.channels[1] = Some(4);
+        dup.sanitize();
+        assert_eq!(dup.channels, [Some(4), None]);
+    }
+
+    #[test]
+    fn bus_sub_paths_read_within_the_bus_and_are_found_by_id_and_name() {
+        let mut s = Session::default();
+        let id = s.add_bus("Verb", ChannelFormat::Stereo);
+        let subs = default_bus_sub_paths(s.bus(id).unwrap(), || 77);
+        assert_eq!(subs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Verb.L", "Verb.R"]);
+        assert_eq!(subs[1].channels, [Some(1)]);
+        s.busses[0].sub_paths = subs;
+        s.busses[0].sub_paths[0].id = BusSubId(5);
+        s.busses[0].sub_paths[1].id = BusSubId(6);
+        assert_eq!(s.bus_sub(BusSubId(6)).map(|(b, sp)| (b.name.as_str(), sp.name.as_str())), Some(("Verb", "Verb.R")));
+        assert!(s.bus_sub(BusSubId(9)).is_none());
+        assert_eq!(s.bus_path_by_name("verb.l").map(|(b, sp)| (b.id, sp.map(|sp| sp.id))), Some((id, Some(BusSubId(5)))));
+        assert_eq!(s.bus_path_by_name("VERB").map(|(b, sp)| (b.id, sp.is_none())), Some((id, true)));
+        let mut sp = BusSubPath::new(BusSubId(1), "wide", ChannelFormat::Stereo);
+        sp.assign_from(1, 2);
+        assert_eq!(sp.channels, [Some(1), None], "the second channel falls off the bus");
+        s.busses[0].sub_paths.push(BusSubPath { id: BusSubId(2), name: "bad".into(), format: ChannelFormat::Mono, channels: vec![Some(9)] });
+        s.sanitize();
+        assert_eq!(s.busses[0].sub_paths[2].channels, [None]);
+        assert!(s.next_id > 6, "sub-path ids count toward the allocator");
+    }
+
+    #[test]
+    fn default_busses_and_output_busses() {
+        let mut s = Session::new("x", Default::default());
+        s.outputs = Session::default_output_paths(4);
+        let made = s.add_default_busses(2);
+        assert_eq!(made.len(), 2);
+        assert_eq!(s.busses.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Bus 1-2", "Bus 3-4"]);
+        assert_eq!(s.busses[0].sub_paths.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Bus 1-2.L", "Bus 1-2.R"]);
+        let ids: std::collections::BTreeSet<u64> = s.busses.iter().flat_map(|b| b.sub_paths.iter().map(|p| p.id.0)).collect();
+        assert_eq!(ids.len(), 4, "every sub-path has its own id");
+        assert_eq!(s.add_default_busses(2).len(), 0, "already there");
+        let out = s.add_output_busses();
+        assert_eq!(out.len(), 2);
+        assert_eq!(s.bus_by_name("Out 3-4").and_then(|b| b.output.as_deref()), Some("Out 3-4"));
+        assert_eq!(s.add_output_busses().len(), 2, "mapped again, not duplicated");
+        assert_eq!(s.busses.len(), 4);
     }
 }

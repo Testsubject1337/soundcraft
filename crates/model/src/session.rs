@@ -318,6 +318,12 @@ pub struct Session {
     #[serde(default = "default_inputs")]
     pub inputs: Vec<crate::InputPath>,
     pub outputs: Vec<OutputPath>,
+    /// The output path the main mix (and Route::Main) drives: the first active one when unset.
+    #[serde(default)]
+    pub monitor_output: Option<String>,
+    /// The output path the main meter shows: the monitor path when unset.
+    #[serde(default)]
+    pub meter_output: Option<String>,
     pub markers: Vec<MemoryLocation>,
     pub groups: Vec<Group>,
     pub edit: EditState,
@@ -365,7 +371,9 @@ impl Session {
             videos: Vec::new(),
             busses: Vec::new(),
             inputs: default_inputs(),
-            outputs: vec![OutputPath { name: "Out 1-2".into(), first_channel: 0, format: ChannelFormat::Stereo }],
+            outputs: vec![OutputPath::assigned("Out 1-2", ChannelFormat::Stereo, 0)],
+            monitor_output: None,
+            meter_output: None,
             markers: Vec::new(),
             groups: Vec::new(),
             edit: EditState::default(),
@@ -508,7 +516,7 @@ impl Session {
             return b.id;
         }
         let id = BusId(self.alloc());
-        self.busses.push(Bus { id, name: name.to_string(), format });
+        self.busses.push(Bus { id, name: name.to_string(), format, active: true, output: None, sub_paths: Vec::new() });
         id
     }
 
@@ -564,6 +572,7 @@ impl Session {
             .chain(self.sources.iter().map(|s| s.id.0))
             .chain(self.videos.iter().map(|v| v.id.0))
             .chain(self.busses.iter().map(|b| b.id.0))
+            .chain(self.busses.iter().flat_map(|b| b.sub_paths.iter().map(|sp| sp.id.0)))
             .chain(self.markers.iter().map(|m| m.id.0))
             .chain(self.groups.iter().map(|g| g.id.0))
             .max()
@@ -627,10 +636,14 @@ impl Session {
             }
             truncate_chars(&mut v.name, MAX_NAME_CHARS);
         }
-        self.busses.iter_mut().for_each(|b| truncate_chars(&mut b.name, MAX_NAME_CHARS));
+        self.busses.iter_mut().for_each(crate::Bus::sanitize);
         self.inputs.truncate(crate::MAX_INPUT_PATHS);
         self.inputs.iter_mut().for_each(|p| p.sanitize(true));
-        self.outputs.iter_mut().for_each(|o| truncate_chars(&mut o.name, MAX_NAME_CHARS));
+        self.outputs.truncate(crate::MAX_INPUT_PATHS);
+        self.outputs.iter_mut().for_each(crate::OutputPath::sanitize);
+        for n in [&mut self.monitor_output, &mut self.meter_output].into_iter().flatten() {
+            truncate_chars(n, MAX_NAME_CHARS);
+        }
         self.groups.iter_mut().for_each(|g| truncate_chars(&mut g.name, MAX_NAME_CHARS));
         self.sources.iter_mut().for_each(|s| truncate_chars(&mut s.name, MAX_NAME_CHARS));
         // Drop performances whose clip no longer exists anywhere (any playlist).

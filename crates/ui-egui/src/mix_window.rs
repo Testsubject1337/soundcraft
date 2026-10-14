@@ -61,13 +61,17 @@ pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
     });
 }
 
-/// Format of the destination a track's output feeds (the main mix, a bus, or stereo).
+/// Format of the destination a track's output feeds (the main mix, a bus or bus sub-path, an
+/// output path, or stereo).
 fn output_format(app: &SoundApp, track: &Track) -> ChannelFormat {
     let s = app.engine.session();
     match &track.mixer.output {
         Route::Main => s.main_format(),
         Route::Bus(b) => s.bus(*b).map_or(ChannelFormat::Stereo, |b| b.format),
-        _ => ChannelFormat::Stereo,
+        Route::BusSub(id) => s.bus_sub(*id).map_or(ChannelFormat::Stereo, |(_, sp)| sp.format),
+        Route::Hardware(h) if s.is_monitor_output(h) => s.main_format(),
+        Route::Hardware(h) => s.output_path(h).map_or(ChannelFormat::Stereo, |o| o.format),
+        Route::None => ChannelFormat::Stereo,
     }
 }
 
@@ -131,12 +135,24 @@ fn section_label(ui: &Ui, r: Rect, text: &str, narrow: bool) {
 }
 
 pub(crate) fn route_name(app: &SoundApp, r: &Route) -> String {
+    let s = app.engine.session();
     match r {
         Route::None => "no output".into(),
-        Route::Main => app.engine.session().outputs.first().map_or_else(|| "Out 1-2".into(), |o| o.name.clone()),
-        Route::Bus(b) => app.engine.session().bus(*b).map_or_else(|| "bus?".into(), |b| b.name.clone()),
+        Route::Main => s.monitor_output_path().map_or_else(|| "Out 1-2".into(), |o| o.name.clone()),
+        Route::Bus(b) => s.bus(*b).map_or_else(|| "bus?".into(), |b| b.name.clone()),
+        Route::BusSub(id) => s.bus_sub(*id).map_or_else(|| "sub-path?".into(), |(_, sp)| sp.name.clone()),
         Route::Hardware(h) => h.clone(),
     }
+}
+
+/// The busses and their sub-paths (indented) as a menu lists them: (shown, name).
+pub(crate) fn bus_entries(app: &SoundApp) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for b in app.engine.session().busses.iter().filter(|b| b.active) {
+        out.push((b.name.clone(), b.name.clone()));
+        out.extend(b.sub_paths.iter().map(|sp| (format!("    {}", sp.name), sp.name.clone())));
+    }
+    out
 }
 
 pub(crate) fn input_name(app: &SoundApp, track: &Track) -> String {
@@ -1223,21 +1239,27 @@ fn send_level_scale(ui: &mut Ui, db: f32) {
 }
 
 fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, current: Option<&Route>) {
-    let busses = app.engine.session().busses.clone();
+    // Busses with their sub-paths, then the output paths, as Pro Tools' send selector lists them.
+    let mut entries = bus_entries(app);
+    entries.extend(app.engine.session().outputs.iter().filter(|o| o.active).map(|o| (o.name.clone(), o.name.clone())));
+    let current_name = current.map(|r| route_name(app, r));
     let search = MenuSearch::show(ui, egui::Id::new(("send-bus-search", id.0, slot)), "Search buses…");
-    let visible: Vec<_> = busses.iter().filter(|bus| search.matches(&bus.name)).collect();
+    let visible: Vec<&(String, String)> = entries.iter().filter(|(_, name)| search.matches(name)).collect();
     let picked = search.rows(ui, visible.len(), 260.0, |ui, i, highlighted| {
-        let current = matches!(current, Some(Route::Bus(bus_id)) if *bus_id == visible[i].id);
-        menu_row(ui, highlighted || (current && !search.typing()), &visible[i].name)
+        let is_current = current_name.as_deref() == Some(visible[i].1.as_str());
+        menu_row(ui, highlighted || (is_current && !search.typing()), &visible[i].0)
     });
     if let Some(i) = picked {
-        let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": visible[i].name}));
+        let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": visible[i].1}));
         ui.close();
     }
     ui.separator();
     if ui.button("new bus...").clicked() {
+        let busses = app.engine.session().busses.clone();
         let mut n = busses.len() + 1;
-        while busses.iter().any(|bus| bus.name == format!("Bus {n}")) || app.engine.session().track_by_name(&format!("Bus {n}")).is_some() {
+        while app.engine.session().bus_path_by_name(&format!("Bus {n}")).is_some()
+            || app.engine.session().track_by_name(&format!("Bus {n}")).is_some()
+        {
             n += 1;
         }
         let _ = app.run("mix.send", json!({"track": id.0, "slot": slot, "bus": format!("Bus {n}")}));
@@ -1250,10 +1272,23 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         assign_route(app, ui, id, input, "none");
         ui.close();
     }
-    let main_name = app.engine.session().outputs.first().map_or_else(|| "Out 1-2".to_string(), |o| o.name.clone());
+    let main_name = app.engine.session().monitor_output_path().map_or_else(|| "Out 1-2".to_string(), |o| o.name.clone());
     if !input && ui.button(main_name).clicked() {
         assign_route(app, ui, id, input, "main");
         ui.close();
+    }
+    if !input {
+        // The other output paths (Setup › I/O › Output).
+        let paths: Vec<String> = {
+            let s = app.engine.session();
+            s.outputs.iter().filter(|o| o.active && !s.is_monitor_output(&o.name)).map(|o| o.name.clone()).collect()
+        };
+        for name in paths {
+            if ui.button(&name).clicked() {
+                assign_route(app, ui, id, input, &name);
+                ui.close();
+            }
+        }
     }
     if input {
         // The session's input paths of the track's width (every active one when none matches),
@@ -1279,17 +1314,20 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         }
     }
     ui.separator();
-    let busses: Vec<String> = app.engine.session().busses.iter().map(|b| b.name.clone()).collect();
+    // Busses with their sub-paths (indented), as Pro Tools lists them.
+    let entries = bus_entries(app);
     ui.strong("Bus");
     let search = MenuSearch::show(ui, egui::Id::new(("route-bus-search", id.0, input)), "Search buses…");
-    let visible: Vec<&String> = busses.iter().filter(|b| search.matches(b)).collect();
-    if let Some(i) = search.rows(ui, visible.len(), 420.0, |ui, i, highlighted| menu_row(ui, highlighted, visible[i])) {
-        assign_route(app, ui, id, input, visible[i]);
+    let visible: Vec<&(String, String)> = entries.iter().filter(|(_, name)| search.matches(name)).collect();
+    if let Some(i) = search.rows(ui, visible.len(), 420.0, |ui, i, highlighted| menu_row(ui, highlighted, &visible[i].0)) {
+        assign_route(app, ui, id, input, &visible[i].1);
         ui.close();
     }
     if ui.button("new bus...").clicked() {
-        let mut n = busses.len() + 1;
-        while busses.contains(&format!("Bus {n}")) || app.engine.session().track_by_name(&format!("Bus {n}")).is_some() {
+        let mut n = app.engine.session().busses.len() + 1;
+        while app.engine.session().bus_path_by_name(&format!("Bus {n}")).is_some()
+            || app.engine.session().track_by_name(&format!("Bus {n}")).is_some()
+        {
             n += 1;
         }
         assign_route(app, ui, id, input, &format!("Bus {n}"));

@@ -104,6 +104,8 @@ pub struct UiState {
     /// window then always shows Edit.
     pub mix_separate: bool,
     pub show_io_setup: bool,
+    /// The tab the I/O Setup window opens on next (`window.io_setup {tab}`): input, output or bus.
+    pub io_setup_tab: Option<String>,
     pub show_shortcuts: bool,
     pub show_clip_effects: bool,
     pub show_beat_detective: bool,
@@ -168,6 +170,7 @@ impl Default for UiState {
             audio: soundcraft_playback::AudioConfig::default(),
             mix_separate: false,
             show_io_setup: false,
+            io_setup_tab: None,
             show_shortcuts: false,
             show_clip_effects: false,
             show_beat_detective: false,

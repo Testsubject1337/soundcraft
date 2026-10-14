@@ -823,11 +823,18 @@ fn select_playlist(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({}))
 }
 
+/// A route from its name: none, the main mix (also the monitor output path's name), a bus, a
+/// bus sub-path, else a hardware path by name.
 pub(crate) fn parse_route(s: &soundcraft_model::Session, v: &str) -> Route {
     match v.to_ascii_lowercase().as_str() {
         "" | "none" | "no input" | "no output" => Route::None,
-        "main" | "out 1-2" | "master" => Route::Main,
-        _ => s.bus_by_name(v).map_or_else(|| Route::Hardware(v.to_string()), |b| Route::Bus(b.id)),
+        "main" | "master" => Route::Main,
+        _ if s.is_monitor_output(v) => Route::Main,
+        _ => match s.bus_path_by_name(v) {
+            Some((_, Some(sp))) => Route::BusSub(sp.id),
+            Some((b, None)) => Route::Bus(b.id),
+            None => Route::Hardware(v.to_string()),
+        },
     }
 }
 
@@ -865,8 +872,16 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
         }
         return Ok(json!({"input": "cascade", "tracks": assigned}));
     }
+    // A name that is no path and no bus makes a bus (an aux's return), unless it is a hardware
+    // path of the kind being routed.
+    let is_path = match &r {
+        Route::Hardware(name) if input => s.input_path(name).is_some(),
+        Route::Hardware(name) => s.output_path(name).is_some(),
+        _ => false,
+    };
     if let Route::Hardware(name) = &r
         && create_bus
+        && !is_path
         && !name.to_ascii_lowercase().starts_with("in ")
     {
         let fmt = tracks
