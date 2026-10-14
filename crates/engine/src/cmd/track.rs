@@ -840,6 +840,12 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     let s = e.session_mut();
     let mut r = parse_route(s, &v);
     if cascade {
+        if input
+            && let Route::Hardware(name) = &r
+            && s.find_input_path(name).is_some()
+        {
+            return cascade_paths(s, &tracks, name);
+        }
         // Checked before anything changes: a bus or "none" has no next channel.
         let first = match &r {
             Route::Hardware(name) if input => hardware_input_channel(name),
@@ -881,8 +887,37 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     Ok(json!({key: r}))
 }
 
-/// Hardware input paths are named by channel, `In 3` for one channel and `In 3-4` for two, which
-/// is what recording reads (`io::plan_takes`). Channel numbers are capped here.
+/// The cascade over the session's input paths: the first track gets the clicked path (or the next
+/// one of its width), each next track the next path of its width that starts after the channels
+/// the previous one took, so a mono track after a stereo one skips both of its channels. Only
+/// active, fully assigned paths count; a track with no path left keeps its input.
+fn cascade_paths(s: &mut Session, tracks: &[TrackId], first: &str) -> Result<Value> {
+    let paths: Vec<(String, usize, u16, u16)> = s
+        .input_paths_flat()
+        .iter()
+        .filter(|(p, active)| *active && p.complete() && p.width() > 0)
+        .map(|(p, _)| {
+            let hw: Vec<u16> = p.channels.iter().flatten().copied().collect();
+            (p.name.clone(), p.width(), hw.iter().copied().min().unwrap_or(0), hw.iter().copied().max().unwrap_or(0))
+        })
+        .collect();
+    let mut from = paths.iter().find(|(n, ..)| n.eq_ignore_ascii_case(first)).map_or(0, |(_, _, lo, _)| *lo);
+    let mut assigned = Vec::new();
+    for t in tracks {
+        let Some(tr) = s.track_mut(*t) else { continue };
+        let width = tr.channels().max(1);
+        let Some((name, _, _, hi)) = paths.iter().filter(|(_, w, lo, _)| *w == width && *lo >= from).min_by_key(|(_, _, lo, _)| *lo) else {
+            break;
+        };
+        tr.mixer.input = Route::Hardware(name.clone());
+        assigned.push(json!({"track": t.0, "input": tr.mixer.input}));
+        from = hi.saturating_add(1);
+    }
+    Ok(json!({"input": "cascade", "tracks": assigned}))
+}
+
+/// Hardware input names without a path behind them are read by channel, `In 3` for one channel
+/// and `In 3-4` for two (what the default paths are called). Channel numbers are capped here.
 const MAX_HARDWARE_INPUT: usize = 1024;
 
 /// The first channel (from 1) a hardware input path names: `In 3` and `In 3-4` → 3; `None` for
@@ -1057,10 +1092,27 @@ mod route_tests {
         let out = e.execute("track.input", &json!({"tracks": [vox, gtr, bass], "input": "In 3", "cascade": true})).unwrap();
         assert_eq!(out["tracks"].as_array().map(Vec::len), Some(3));
         assert_eq!(input(&e, vox), Route::Hardware("In 3".into()));
-        assert_eq!(input(&e, gtr), Route::Hardware("In 4-5".into()), "a stereo track takes two channels");
-        assert_eq!(input(&e, bass), Route::Hardware("In 6".into()));
+        assert_eq!(input(&e, gtr), Route::Hardware("In 5-6".into()), "the next stereo path after channel 3");
+        assert_eq!(input(&e, bass), Route::Hardware("In 7".into()), "the next mono path after the pair");
         assert!(e.undo());
         assert_eq!((input(&e, vox), input(&e, bass)), (before.clone(), before), "one step undoes all three");
+    }
+
+    #[test]
+    fn cascade_runs_over_the_paths_in_channel_order_and_stops_when_they_run_out() {
+        let mut e = Engine::default();
+        let (a, b, c) = (new(&mut e, "A", "stereo"), new(&mut e, "B", "stereo"), new(&mut e, "C", "mono"));
+        e.execute("track.input", &json!({"tracks": [a, b, c], "input": "In 5-6", "cascade": true})).unwrap();
+        assert_eq!((input(&e, a), input(&e, b)), (Route::Hardware("In 5-6".into()), Route::Hardware("In 7-8".into())));
+        assert_eq!(input(&e, c), Route::None, "no mono path after channel 8: unchanged");
+        // Inactive and unassigned paths are skipped.
+        e.execute("setup.io", &json!({"action": "set_input_active", "name": "In 3-4", "active": false})).unwrap();
+        e.execute("setup.io", &json!({"action": "map_input", "name": "In 5-6", "hardware": null})).unwrap();
+        e.execute("track.input", &json!({"tracks": [a, b], "input": "In 1-2", "cascade": true})).unwrap();
+        assert_eq!((input(&e, a), input(&e, b)), (Route::Hardware("In 1-2".into()), Route::Hardware("In 7-8".into())));
+        // Clicking a path of another width starts at its channels.
+        e.execute("track.input", &json!({"tracks": [c], "input": "In 7-8", "cascade": true})).unwrap();
+        assert_eq!(input(&e, c), Route::Hardware("In 7".into()));
     }
 
     #[test]

@@ -314,6 +314,9 @@ pub struct Session {
     #[serde(default)]
     pub videos: Vec<VideoSource>,
     pub busses: Vec<Bus>,
+    /// Physical input paths (Setup › I/O › Input). Sessions from before they existed get the defaults.
+    #[serde(default = "default_inputs")]
+    pub inputs: Vec<crate::InputPath>,
     pub outputs: Vec<OutputPath>,
     pub markers: Vec<MemoryLocation>,
     pub groups: Vec<Group>,
@@ -330,6 +333,12 @@ pub struct Session {
     /// The folder relative source paths point into: where the session was opened or last saved.
     #[serde(skip)]
     pub folder: Option<std::path::PathBuf>,
+}
+
+/// The input paths of a new session, and of one saved before input paths existed: eight channels,
+/// as the `In 1`…`In 8` inputs tracks could name until then.
+fn default_inputs() -> Vec<crate::InputPath> {
+    Session::default_input_paths(8)
 }
 
 impl Default for Session {
@@ -355,6 +364,7 @@ impl Session {
             sources: Vec::new(),
             videos: Vec::new(),
             busses: Vec::new(),
+            inputs: default_inputs(),
             outputs: vec![OutputPath { name: "Out 1-2".into(), first_channel: 0, format: ChannelFormat::Stereo }],
             markers: Vec::new(),
             groups: Vec::new(),
@@ -618,6 +628,8 @@ impl Session {
             truncate_chars(&mut v.name, MAX_NAME_CHARS);
         }
         self.busses.iter_mut().for_each(|b| truncate_chars(&mut b.name, MAX_NAME_CHARS));
+        self.inputs.truncate(crate::MAX_INPUT_PATHS);
+        self.inputs.iter_mut().for_each(|p| p.sanitize(true));
         self.outputs.iter_mut().for_each(|o| truncate_chars(&mut o.name, MAX_NAME_CHARS));
         self.groups.iter_mut().for_each(|g| truncate_chars(&mut g.name, MAX_NAME_CHARS));
         self.sources.iter_mut().for_each(|s| truncate_chars(&mut s.name, MAX_NAME_CHARS));

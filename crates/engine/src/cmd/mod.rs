@@ -19,6 +19,7 @@ mod event_more;
 mod file;
 mod health;
 mod instrument;
+mod io_inputs;
 mod midi;
 mod mix;
 mod more_util;

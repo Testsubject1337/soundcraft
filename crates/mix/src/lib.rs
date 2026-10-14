@@ -910,16 +910,13 @@ fn process_strip(
     let transport = transport_at(s, pos, !live.monitor_only, live.recording);
     match t.kind {
         TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
-            // Input monitoring: the track hears its hardware input instead of its clips.
-            let first = match &t.mixer.input {
-                Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
+            // Input monitoring: the track hears the hardware channels its input path feeds it
+            // instead of its clips (a channel nothing feeds stays silent).
+            let chans = s.input_route_channels(&t.mixer.input, strip.buf.len());
             let n_in = live.input.len().max(1);
             for (k, dst) in strip.buf.iter_mut().enumerate() {
-                if let Some(src) = live.input.get((first + k) % n_in) {
+                let Some(ch) = chans.get(k).copied().flatten() else { continue };
+                if let Some(src) = live.input.get(usize::from(ch) % n_in) {
                     for (d, x) in dst.iter_mut().zip(src.iter()).take(frames) {
                         *d = *x;
                     }

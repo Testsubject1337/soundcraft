@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (drag across checkboxes, #399; waveforms preview fades during drag) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-14 · **Change:** minor (I/O Setup Input tab: paths, sub-paths and the channel grid; previously: drag across checkboxes, #399) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 How SoundCraft feels in the hands of a Pro Tools user: tools, modes, modifiers, shortcuts,
 windows, meters. Measured from `crates/model/src/session.rs` (tools, modes), the command
@@ -47,7 +47,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | MIDI Editor, Score Editor, Event List | 🟡 | Dock height bug fixed (#113); notation editing shallow |
 | Transport, Big Counter, Memory Locations, Automation, Video, Universe, Renderer, UI Customization | ✅ present | |
 | Workspace / sound browser with previews | ❌ | G-16 |
-| I/O Setup | 🟡 | Busses and paths; no hardware channel matrix (G-01) |
+| I/O Setup | 🟡 | Input tab as Pro Tools lays it out: main paths with sub-paths (active, name, format) beside the channel grid of the input device, New Path (count, format, name, default assignments, auto sub-paths), New Sub-Path, Delete Path, Default, Default Format; Output tab lists paths by first channel only; Bus tab; no Insert, Mic Preamps or H/W Insert Delay tabs, no drag-reorder or Path Order (G-01) |
 | Preferences | 🟡 | Many settings stored, fewer honoured |
 | Window configurations, Tile/Cascade | 🟡 | Configurations ✅; Tile/Cascade in PR #151 |
 | Plugin windows | 🟡 | Generic parameter sliders; Pro Tools plugins have bespoke GUIs (#138 asks for skeuomorphic design); multi-page plugin views (#6) |
@@ -68,6 +68,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | I/O Setup: Input tab with main paths, sub-paths and the channel grid; the track input menus list the session's paths |
 | 2026-10-13 | minor | Drag across checkboxes (#399) |
 | 2026-10-13 | minor | Waveforms and fade curves share temporary envelopes during drag, without rebuilding media or editing the document before release. Readiness estimate unchanged |
 | 2026-10-13 | minor | Fade curves use bounded physical-pixel sampling; midpoint handles stay visible and inside the clip, with repeat-drag coverage after extreme bends. Readiness estimate unchanged |

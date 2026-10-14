@@ -1256,9 +1256,24 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         ui.close();
     }
     if input {
-        for i in 1..=8 {
-            if ui.button(format!("In {i}")).clicked() {
-                assign_route(app, ui, id, input, &format!("In {i}"));
+        // The session's input paths of the track's width (every active one when none matches),
+        // sub-paths indented under their main path; Setup › I/O defines them.
+        let (width, paths) = {
+            let s = app.engine.session();
+            let width = s.track(id).map_or(1, Track::channels);
+            let mut paths: Vec<(String, usize, bool)> = Vec::new();
+            for m in s.inputs.iter().filter(|m| m.active) {
+                paths.push((m.name.clone(), m.width(), false));
+                paths.extend(m.sub_paths.iter().filter(|sp| sp.active).map(|sp| (sp.name.clone(), sp.width(), true)));
+            }
+            (width, paths)
+        };
+        let fits = paths.iter().any(|(_, w, _)| *w == width);
+        for (name, w, is_sub) in paths.iter().filter(|(_, w, _)| !fits || *w == width) {
+            let text = if *is_sub { format!("    {name}") } else { name.clone() };
+            let text = if *w == width { text } else { format!("{text}  ({w} ch)") };
+            if ui.button(text).clicked() {
+                assign_route(app, ui, id, input, name);
                 ui.close();
             }
         }

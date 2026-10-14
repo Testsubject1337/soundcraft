@@ -56,7 +56,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "I/O...",
             ["Setup"],
             None,
-            "{action?: list|create_bus|rename_bus|delete_bus|create_output|rename_output|delete_output, name?, new_name?, format?: stereo, first_channel?: 0}",
+            "{action?: list|create_bus|rename_bus|delete_bus|create_output|rename_output|delete_output|create_input|create_input_subpath|rename_input|delete_input|set_input_format|map_input|set_input_channel|set_input_active|default_inputs, name?, new_name?, format?: stereo, first_channel?: 0, count?, path?, channel?, hardware?: n|null, active?, channels?, device_channels?, assign?, sub_paths?} — input paths: main paths with sub-paths, each channel mapped to a hardware input channel (0-based)",
             always,
             io_setup
         ),
@@ -218,7 +218,7 @@ fn peripherals(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn io_state(s: &Session) -> Value {
-    json!({"busses": s.busses, "outputs": s.outputs})
+    json!({"busses": s.busses, "inputs": s.inputs, "outputs": s.outputs})
 }
 
 fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -226,6 +226,9 @@ fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
     let action = str_param(p, "action").unwrap_or("list");
     if action == "list" {
         return Ok(io_state(e.session()));
+    }
+    if let Some(r) = super::io_inputs::input_action(e, action, p) {
+        return r;
     }
     let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(id, "`name` required"))?.to_string();
     let new_name = str_param(p, "new_name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
