@@ -76,17 +76,24 @@ pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_io_setup = open;
 }
 
-/// The input device the grid shows: the open one, else the one the Playback Engine chooses
-/// (enumerated once per window), else nothing known.
+/// The input device the grid shows and how many inputs it has: the open one, else the one the
+/// Playback Engine chooses (enumerated once per window), else nothing known. The count is every
+/// channel the device offers, not just those the open stream carries.
 fn input_device(app: &SoundApp, ctx: &egui::Context) -> (String, usize) {
-    if let Some(r) = &app.recorder {
-        return (r.device_name.clone(), r.channels);
-    }
     let systems = crate::windows::audio_systems(ctx, false);
     let sys = crate::windows::chosen_system(&systems, &app.ui.audio);
-    match sys.and_then(|s| crate::windows::chosen_device(&s.inputs, app.ui.audio.input.as_deref())) {
-        Some(d) => (d.name.clone(), usize::from(d.max_channels)),
-        None => ("Input device".into(), 0),
+    let open = app.recorder.as_ref().map(|r| (r.device_name.clone(), r.channels));
+    let known = sys.and_then(|s| match &open {
+        Some((name, _)) => {
+            s.inputs.iter().find(|d| d.name == *name).or_else(|| crate::windows::chosen_device(&s.inputs, app.ui.audio.input.as_deref()))
+        }
+        None => crate::windows::chosen_device(&s.inputs, app.ui.audio.input.as_deref()),
+    });
+    match (open, known) {
+        (Some((name, ch)), Some(d)) => (name, ch.max(usize::from(d.max_channels))),
+        (Some((name, ch)), None) => (name, ch),
+        (None, Some(d)) => (d.name.clone(), usize::from(d.max_channels)),
+        (None, None) => ("Input device".into(), 0),
     }
 }
 
@@ -192,8 +199,13 @@ fn input_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
         {
             pending.push(json!({"action": "delete_input", "name": name}));
         }
-        if ui.button("Default").on_hover_text("A stereo path per channel pair of the input device, with mono sub-paths").clicked() {
-            pending.push(json!({"action": "default_inputs", "channels": device_channels.max(2)}));
+        let every = if device_channels == 0 { 8 } else { device_channels };
+        if ui
+            .button("Default")
+            .on_hover_text(format!("Every input of the device ({every}): a stereo path per channel pair, with mono sub-paths"))
+            .clicked()
+        {
+            pending.push(json!({"action": "default_inputs", "channels": every}));
             st.selected = None;
         }
         ui.add_space(12.0);
