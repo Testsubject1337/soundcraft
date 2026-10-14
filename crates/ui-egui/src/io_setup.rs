@@ -43,6 +43,8 @@ pub(crate) struct Row {
     pub has_subs: bool,
     /// Bus rows: the output path the bus is mapped to.
     pub mapping: Option<String>,
+    /// Output rows: the monitor path, whose format is the main mix's.
+    pub monitor: bool,
     pub kind: RowKind,
 }
 
@@ -133,6 +135,21 @@ pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
             Tab::Output => output_tab(app, ui, &mut st),
             Tab::Bus => bus_tab(app, ui, &mut st),
         }
+        ui.separator();
+        // The settings file holds all three tabs, as a session does; an import merges by name.
+        ui.horizontal(|ui| {
+            if ui.button("Export Settings...").on_hover_text("Write the I/O Setup (all three tabs) to a .scio settings file").clicked() {
+                app.dialogs.open_for_command(&app.engine, "setup.io_export");
+            }
+            if ui
+                .button("Import Settings...")
+                .on_hover_text("Merge a .scio settings file into the I/O Setup by name (busses keep their routing)")
+                .clicked()
+            {
+                app.dialogs.open_for_command(&app.engine, "setup.io_import");
+            }
+            ui.label(RichText::new("The routing is saved with the session; settings files carry it to other sessions and systems.").small().weak());
+        });
     });
     if st.new_path.is_some() {
         new_paths_dialog(app, ctx, &mut st);
@@ -222,6 +239,7 @@ pub(crate) fn input_rows(paths: &[InputPath]) -> Vec<Row> {
             within: None,
             has_subs: !m.sub_paths.is_empty(),
             mapping: None,
+            monitor: false,
             kind: RowKind::Input,
         });
         for sp in &m.sub_paths {
@@ -234,6 +252,7 @@ pub(crate) fn input_rows(paths: &[InputPath]) -> Vec<Row> {
                 within: Some(m.channels.clone()),
                 has_subs: false,
                 mapping: None,
+                monitor: false,
                 kind: RowKind::Input,
             });
         }
@@ -241,8 +260,8 @@ pub(crate) fn input_rows(paths: &[InputPath]) -> Vec<Row> {
     rows
 }
 
-/// The rows of the Output tab: the paths, none with sub-paths.
-pub(crate) fn output_rows(paths: &[OutputPath]) -> Vec<Row> {
+/// The rows of the Output tab: the paths, none with sub-paths; `monitor` names the monitor path.
+pub(crate) fn output_rows(paths: &[OutputPath], monitor: Option<&str>) -> Vec<Row> {
     paths
         .iter()
         .map(|o| Row {
@@ -254,6 +273,7 @@ pub(crate) fn output_rows(paths: &[OutputPath]) -> Vec<Row> {
             within: None,
             has_subs: false,
             mapping: None,
+            monitor: monitor.is_some_and(|m| m.eq_ignore_ascii_case(&o.name)),
             kind: RowKind::Output,
         })
         .collect()
@@ -274,6 +294,7 @@ pub(crate) fn bus_rows(busses: &[Bus]) -> Vec<Row> {
             within: None,
             has_subs: !b.sub_paths.is_empty(),
             mapping: b.output.clone(),
+            monitor: false,
             kind: RowKind::Bus,
         });
         for sp in &b.sub_paths {
@@ -286,6 +307,7 @@ pub(crate) fn bus_rows(busses: &[Bus]) -> Vec<Row> {
                 within: Some(own.clone()),
                 has_subs: false,
                 mapping: None,
+                monitor: false,
                 kind: RowKind::BusSub,
             });
         }
@@ -334,7 +356,7 @@ fn input_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
     let (device, device_channels) = input_device(app, ui.ctx());
     let rows = input_rows(&app.engine.session().inputs);
     let columns = grid_columns(device_channels, &rows);
-    let mut pending: Vec<Value> = Vec::new();
+    let mut pending: Vec<(&'static str, Value)> = Vec::new();
     let mut select: Option<Option<String>> = None;
     let spec = GridSpec { device: &device, columns, mapping: false, outputs: &[] };
     grid(ui, st, &rows, &spec, &mut pending, &mut select, "io-in");
@@ -358,20 +380,22 @@ fn input_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
         if ui.add_enabled(selected_main, egui::Button::new("New Sub-Path")).on_hover_text("A path within the selected main path").clicked()
             && let Some(name) = &st.selected
         {
-            pending.push(json!({"action": "create_input_subpath", "path": name, "format": "Mono"}));
+            pending.push(("setup.io", json!({"action": "create_input_subpath", "path": name, "format": "Mono"})));
         }
         if ui.add_enabled(selected_any, egui::Button::new("Delete Path")).clicked()
             && let Some(name) = st.selected.take()
         {
-            pending.push(json!({"action": "delete_input", "name": name}));
+            pending.push(("setup.io", json!({"action": "delete_input", "name": name})));
         }
-        let every = if device_channels == 0 { 8 } else { device_channels };
+        // Every input the device reports, and never fewer than a new session has (some drivers
+        // report one stereo pair of a four-input interface).
+        let every = device_channels.max(8);
         if ui
             .button("Default")
             .on_hover_text(format!("Every input of the device ({every}): a stereo path per channel pair, with mono sub-paths"))
             .clicked()
         {
-            pending.push(json!({"action": "default_inputs", "channels": every}));
+            pending.push(("setup.io", json!({"action": "default_inputs", "channels": every})));
             st.selected = None;
         }
         default_format_combo(ui, st);
@@ -387,9 +411,12 @@ fn input_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
 fn output_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
     let t = Tokens::current();
     let (device, device_channels) = output_device(app, ui.ctx());
-    let rows = output_rows(&app.engine.session().outputs);
+    let rows = {
+        let s = app.engine.session();
+        output_rows(&s.outputs, s.monitor_output_path().map(|o| o.name.as_str()))
+    };
     let columns = grid_columns(device_channels, &rows);
-    let mut pending: Vec<Value> = Vec::new();
+    let mut pending: Vec<(&'static str, Value)> = Vec::new();
     let mut select: Option<Option<String>> = None;
     let spec = GridSpec { device: &device, columns, mapping: false, outputs: &[] };
     grid(ui, st, &rows, &spec, &mut pending, &mut select, "io-out");
@@ -418,23 +445,25 @@ fn output_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
         if ui.add_enabled(selected_any, egui::Button::new("Delete Path")).clicked()
             && let Some(name) = st.selected.take()
         {
-            pending.push(json!({"action": "delete_output", "name": name}));
+            pending.push(("setup.io", json!({"action": "delete_output", "name": name})));
         }
-        let every = if device_channels == 0 { 2 } else { device_channels };
+        let every = device_channels.max(2);
         if ui
             .button("Default")
             .on_hover_text(format!("Every output of the device ({every}): a stereo path per channel pair, the first the monitor path"))
             .clicked()
         {
-            pending.push(json!({"action": "default_outputs", "channels": every}));
+            pending.push(("setup.io", json!({"action": "default_outputs", "channels": every})));
             st.selected = None;
         }
         default_format_combo(ui, st);
         ui.add_space(16.0);
         ui.label("Monitor Path:");
-        path_combo(ui, "io-monitor", monitor.as_deref(), &paths, |name| pending.push(json!({"action": "set_monitor_output", "name": name})));
+        path_combo(ui, "io-monitor", monitor.as_deref(), &paths, |name| {
+            pending.push(("setup.io", json!({"action": "set_monitor_output", "name": name})))
+        });
         ui.label("Output Meter Path:");
-        path_combo(ui, "io-meter", meter.as_deref(), &paths, |name| pending.push(json!({"action": "set_meter_output", "name": name})));
+        path_combo(ui, "io-meter", meter.as_deref(), &paths, |name| pending.push(("setup.io", json!({"action": "set_meter_output", "name": name}))));
     });
     ui.label(
         RichText::new("The monitor path carries the main mix (its format is the mix's); the meter path is what the main meter shows. Click a cell to drive the device from that channel on; click a lit cell to clear it. Paths may overlap. Inactive paths drive nothing.")
@@ -450,7 +479,7 @@ fn bus_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
     let rows = bus_rows(&busses);
     let columns = bus_columns(&busses);
     let outputs: Vec<(String, usize)> = app.engine.session().outputs.iter().filter(|o| o.active).map(|o| (o.name.clone(), o.width())).collect();
-    let mut pending: Vec<Value> = Vec::new();
+    let mut pending: Vec<(&'static str, Value)> = Vec::new();
     let mut select: Option<Option<String>> = None;
     let spec = GridSpec { device: "Bus channels", columns, mapping: true, outputs: &outputs };
     grid(ui, st, &rows, &spec, &mut pending, &mut select, "io-bus");
@@ -473,19 +502,19 @@ fn bus_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
         if ui.add_enabled(selected == Some(true), egui::Button::new("New Sub-Path")).on_hover_text("A path within the selected bus").clicked()
             && let Some(name) = &st.selected
         {
-            pending.push(json!({"action": "create_bus_subpath", "bus": name, "format": "Mono"}));
+            pending.push(("setup.io", json!({"action": "create_bus_subpath", "bus": name, "format": "Mono"})));
         }
         if ui.add_enabled(selected.is_some(), egui::Button::new("Delete Path")).clicked()
             && let Some(name) = st.selected.take()
         {
-            pending.push(json!({"action": "delete_bus", "name": name}));
+            pending.push(("setup.io", json!({"action": "delete_bus", "name": name})));
         }
         if ui
             .button("Default")
             .on_hover_text("Internal busses Bus 1-2, Bus 3-4… with mono sub-paths, and/or a bus per output path mapped to it")
             .clicked()
         {
-            pending.push(json!({"action": "default_busses", "which": st.bus_default.id(), "count": 8}));
+            pending.push(("setup.io", json!({"action": "default_busses", "which": st.bus_default.id(), "count": 8})));
         }
         egui::ComboBox::from_id_salt("io-bus-default").selected_text(st.bus_default.label()).show_ui(ui, |ui| {
             for d in [BusDefault::All, BusDefault::Output, BusDefault::Internal] {
@@ -502,9 +531,9 @@ fn bus_tab(app: &mut SoundApp, ui: &mut Ui, st: &mut State) {
     run(app, pending);
 }
 
-fn run(app: &mut SoundApp, pending: Vec<Value>) {
-    for p in pending {
-        if let Err(e) = app.run("setup.io", p) {
+fn run(app: &mut SoundApp, pending: Vec<(&'static str, Value)>) {
+    for (cmd, p) in pending {
+        if let Err(e) = app.run(cmd, p) {
             app.ui.status = e;
         }
     }
@@ -538,7 +567,15 @@ fn path_combo(ui: &mut Ui, id: &str, current: Option<&str>, paths: &[String], mu
 }
 
 /// A tab's grid: the column heads (clickable on the Bus tab to sort), then a row per path.
-fn grid(ui: &mut Ui, st: &mut State, rows: &[Row], spec: &GridSpec<'_>, pending: &mut Vec<Value>, select: &mut Option<Option<String>>, id: &str) {
+fn grid(
+    ui: &mut Ui,
+    st: &mut State,
+    rows: &[Row],
+    spec: &GridSpec<'_>,
+    pending: &mut Vec<(&'static str, Value)>,
+    select: &mut Option<Option<String>>,
+    id: &str,
+) {
     let t = Tokens::current();
     let button_h = 120.0;
     let extra = usize::from(spec.mapping);
@@ -570,7 +607,7 @@ fn grid(ui: &mut Ui, st: &mut State, rows: &[Row], spec: &GridSpec<'_>, pending:
             let sorts = [head(ui, "Name", spec.mapping.then_some("name")), head(ui, "Format", spec.mapping.then_some("format"))];
             let mapping_sort = if spec.mapping { head(ui, "Mapping to Output", Some("output")) } else { None };
             for by in sorts.into_iter().chain(std::iter::once(mapping_sort)).flatten() {
-                pending.push(json!({"action": "sort_busses", "by": by}));
+                pending.push(("setup.io", json!({"action": "sort_busses", "by": by})));
             }
             for c in 0..spec.columns {
                 let (r, _) = ui.allocate_exact_size(vec2(CELL, ROW), Sense::hover());
@@ -592,7 +629,14 @@ fn grid(ui: &mut Ui, st: &mut State, rows: &[Row], spec: &GridSpec<'_>, pending:
 }
 
 /// One row of the grid: the path's controls, then a cell per channel.
-fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending: &mut Vec<Value>, select: &mut Option<Option<String>>) {
+fn path_row(
+    ui: &mut Ui,
+    st: &mut State,
+    row: &Row,
+    spec: &GridSpec<'_>,
+    pending: &mut Vec<(&'static str, Value)>,
+    select: &mut Option<Option<String>>,
+) {
     let t = Tokens::current();
     let selected = st.selected.as_deref() == Some(row.name.as_str());
     // Active.
@@ -600,7 +644,7 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
     let toggles = !(row.is_sub && row.kind == RowKind::BusSub);
     if crate::widgets::checkbox(ui, &mut on, "").on_hover_text(if row.is_sub { "Active (with its main path)" } else { "Active" }).changed() && toggles
     {
-        pending.push(json!({"action": action(row.kind, "active"), "name": row.name, "active": on}));
+        pending.push(("setup.io", json!({"action": action(row.kind, "active"), "name": row.name, "active": on})));
     }
     // Fold.
     if row.is_sub || !row.has_subs {
@@ -627,7 +671,7 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
             } else if done {
                 let to = text.trim().to_string();
                 if !to.is_empty() && to != row.name {
-                    pending.push(json!({"action": action(row.kind, "rename"), "name": row.name, "new_name": to}));
+                    pending.push(("setup.io", json!({"action": action(row.kind, "rename"), "name": row.name, "new_name": to})));
                     *select = Some(Some(to));
                 }
                 st.renaming = None;
@@ -646,12 +690,17 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
             }
         }
     }
-    // Format: a sub-path fits within its main path; the main mix is at least stereo.
+    // Format: a sub-path fits within its main path; the monitor path's format is the main mix's
+    // (Setup › Main Format), two to sixteen channels.
     let max = row.within.as_ref().map_or(16, Vec::len);
     egui::ComboBox::from_id_salt(("io-fmt", &row.name)).width(70.0).selected_text(RichText::new(row.format.label()).size(11.0)).show_ui(ui, |ui| {
-        for f in formats_up_to(max) {
+        for f in formats_up_to(max).filter(|f| !row.monitor || f.channels() >= 2) {
             if ui.selectable_label(f == row.format, f.label()).clicked() && f != row.format {
-                pending.push(json!({"action": action(row.kind, "format"), "name": row.name, "format": f.label()}));
+                if row.monitor {
+                    pending.push(("setup.main_format", json!({"format": f.label()})));
+                } else {
+                    pending.push(("setup.io", json!({"action": action(row.kind, "format"), "name": row.name, "format": f.label()})));
+                }
             }
         }
     });
@@ -664,7 +713,7 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
                 let mut mapped = row.mapping.is_some();
                 if crate::widgets::checkbox(ui, &mut mapped, "").on_hover_text("Mapping to Output").changed() {
                     let output = if mapped { fitting.first().map(|(n, _)| json!(n)).unwrap_or(Value::Null) } else { Value::Null };
-                    pending.push(json!({"action": "map_bus_output", "name": row.name, "output": output}));
+                    pending.push(("setup.io", json!({"action": "map_bus_output", "name": row.name, "output": output})));
                 }
                 let shown = row.mapping.clone().unwrap_or_else(|| "(none)".into());
                 egui::ComboBox::from_id_salt(("io-bus-map", &row.name)).width(110.0).selected_text(RichText::new(shown).size(11.0)).show_ui(
@@ -672,12 +721,15 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
                     |ui| {
                         let mods = ui.input(|i| i.modifiers);
                         if ui.selectable_label(row.mapping.is_none(), "(none)").clicked() {
-                            pending.push(json!({"action": "map_bus_output", "name": row.name, "output": null, "all": mods.alt}));
+                            pending.push(("setup.io", json!({"action": "map_bus_output", "name": row.name, "output": null, "all": mods.alt})));
                         }
                         for (name, _) in fitting {
                             if ui.selectable_label(row.mapping.as_deref() == Some(name.as_str()), name).clicked() {
                                 let (all, cascade) = bus_mapping_modifiers(mods);
-                                pending.push(json!({"action": "map_bus_output", "name": row.name, "output": name, "all": all, "cascade": cascade}));
+                                pending.push((
+                                    "setup.io",
+                                    json!({"action": "map_bus_output", "name": row.name, "output": name, "all": all, "cascade": cascade}),
+                                ));
                             }
                         }
                     },
@@ -713,11 +765,13 @@ fn path_row(ui: &mut Ui, st: &mut State, row: &Row, spec: &GridSpec<'_>, pending
             let (map, channel) = (action(row.kind, "map"), action(row.kind, "channel"));
             match cell_click(&row.channels, hw) {
                 CellClick::Clear(k) if row.kind == RowKind::BusSub => {
-                    pending.push(json!({"action": channel, "name": row.name, "channel": k, "bus_channel": null}))
+                    pending.push(("setup.io", json!({"action": channel, "name": row.name, "channel": k, "bus_channel": null})))
                 }
-                CellClick::Clear(k) => pending.push(json!({"action": channel, "name": row.name, "channel": k, "hardware": null})),
-                CellClick::MapFrom(hw) if row.kind == RowKind::BusSub => pending.push(json!({"action": map, "name": row.name, "channel": hw})),
-                CellClick::MapFrom(hw) => pending.push(json!({"action": map, "name": row.name, "hardware": hw})),
+                CellClick::Clear(k) => pending.push(("setup.io", json!({"action": channel, "name": row.name, "channel": k, "hardware": null}))),
+                CellClick::MapFrom(hw) if row.kind == RowKind::BusSub => {
+                    pending.push(("setup.io", json!({"action": map, "name": row.name, "channel": hw})))
+                }
+                CellClick::MapFrom(hw) => pending.push(("setup.io", json!({"action": map, "name": row.name, "hardware": hw}))),
             }
         }
     }
@@ -799,7 +853,9 @@ fn new_paths_dialog(app: &mut SoundApp, ctx: &egui::Context, st: &mut State) {
                 p["sub_paths"] = json!(draft.sub_paths);
             }
         }
-        match app.run("setup.io", p) {
+        // One bus with no sub-paths is the plain New Bus command.
+        let cmd = if draft.tab == Tab::Bus && draft.count == 1 && !draft.sub_paths { "mix.new_bus" } else { "setup.io" };
+        match app.run(cmd, p) {
             Ok(_) => close = true,
             Err(e) => app.ui.status = e,
         }
@@ -828,7 +884,9 @@ mod tests {
         assert_eq!(grid_columns(2, &input_rows(&wide)), 41, "sub-paths count too");
         wide[0].channels[0] = Some(u16::MAX);
         assert_eq!(grid_columns(2, &input_rows(&wide)), usize::from(MAX_INPUT_CHANNEL) + 1, "capped");
-        assert_eq!(grid_columns(2, &output_rows(&Session::default_output_paths(12))), 12);
+        let rows = output_rows(&Session::default_output_paths(12), Some("out 3-4"));
+        assert_eq!(grid_columns(2, &rows), 12);
+        assert_eq!(rows.iter().filter(|r| r.monitor).map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Out 3-4"]);
     }
 
     #[test]
