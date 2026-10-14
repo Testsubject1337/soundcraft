@@ -11,8 +11,6 @@ use std::path::Path;
 
 /// The settings file's extension.
 pub const IO_SETTINGS_EXTENSION: &str = "scio";
-/// The most a settings file may be (hostile files).
-const MAX_FILE_BYTES: u64 = 16 << 20;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -85,7 +83,6 @@ fn export_io(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "setup.io_export";
     let path = path_param(p, id)?;
     let (inputs, outputs, busses) = tabs(p, id)?;
-    crate::file_access::check_write(&path).map_err(EngineError::Io)?;
     let s = e.session();
     let settings = IoSettings {
         format: FORMAT.into(),
@@ -97,22 +94,14 @@ fn export_io(e: &mut Engine, p: &Value) -> Result<Value> {
         meter_output: if outputs { s.meter_output.clone() } else { None },
     };
     let text = serde_json::to_string_pretty(&settings).map_err(|err| EngineError::Io(err.to_string()))?;
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
-    }
-    std::fs::write(&path, text).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+    crate::io::write_file(&path.to_string_lossy(), text.as_bytes())?;
     Ok(json!({"path": path, "inputs": inputs, "outputs": outputs, "busses": busses}))
 }
 
-/// Reads and parses a settings file, refusing anything outside the read root, oversized or not
-/// a settings file.
+/// Reads and parses a settings file through the checked reader (inside the read root, a regular
+/// file), refusing anything that is not a settings file.
 fn read_settings(path: &Path, id: &str) -> Result<IoSettings> {
-    crate::file_access::check_read(path).map_err(EngineError::Io)?;
-    let len = std::fs::metadata(path).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?.len();
-    if len > MAX_FILE_BYTES {
-        return Err(bad(id, format!("{} is {len} bytes; a settings file is at most {MAX_FILE_BYTES}", path.display())));
-    }
-    let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+    let text = crate::io::read_text(path)?;
     let settings: IoSettings =
         serde_json::from_str(&text).map_err(|err| bad(id, format!("{} is not an I/O settings file: {err}", path.display())))?;
     if settings.format != FORMAT {
